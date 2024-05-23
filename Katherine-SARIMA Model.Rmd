@@ -30,8 +30,10 @@ df$Trip.Start.Timestamp <- as.POSIXct(df$Trip.Start.Timestamp, format = "%m/%d/%
 
 
 # Make a new df that only contains YEAR and TOTAL COUNT
-yearly_trips <- mutate(df, Year = year(Trip.Start.Timestamp))
-yearly_trips <- summarise(yearly_trips, Total_Trips = sum(count), .by = Year)  
+yearly_trips <- df %>%
+  mutate(Year = year(Trip.Start.Timestamp)) %>%
+  group_by(Year) %>%
+  summarise(Total_Trips = sum(count))  
 print(yearly_trips)
 
 # Plot
@@ -43,8 +45,10 @@ ggplot(yearly_trips, aes(x = Year, y = Total_Trips)) +
 
 #### **Transform data into Daily Taxi Trips dataset**
 ```{r}
-daily_trips <- mutate(df, Date = as.Date(Trip.Start.Timestamp))
-daily_trips <- summarise(daily_trips, trips_count = sum(count), .by = Date) 
+daily_trips <- df %>%
+  mutate(Date = as.Date(Trip.Start.Timestamp)) %>%  
+  group_by(Date) %>%
+  summarise(trips_count = sum(count)) 
 
 daily_trips <- daily_trips[-nrow(daily_trips),]
 daily_trips
@@ -158,6 +162,77 @@ axis(1, at = seq(15780, 15783, length.out = 6), labels = c("Jul", "Aug", "Sep", 
 lines(x = time(sarima_forecast$mean), y = daily_trips[-(1:length(daily_ts_train)),]$trips_count, col="gold", lwd=2, type="l")
 
 legend("topleft", legend=c("Actual", "Predicted"), col=c("gold", 4), lty=c(1,1), lwd=2, cex=0.6)
+```
+
+
+
+## **Experiment with PULSE Intervention:**
+
+```{R}
+covid_window <- difftime(as.Date("2020-03-01"), as.Date("2013-01-01"), units = "days") : 
+                (difftime(as.Date("2022-06-30"), as.Date("2013-01-01"), units = "days")+1)
+full_window <- 1:(difftime(as.Date("2023-06-30"), as.Date("2013-01-01"), units = "days")+1)
+#add dummy variable
+covid_intervention <- ifelse(full_window %in% covid_window, 1, 0)
+#season length
+season_length <- 7 # (since its weekly seasonality)
+covid_intervention_adj <- covid_intervention[-(1:season_length)]
+#difference the daily TS by 7 (the season length)
+daily_ts_diff <- diff(daily_ts_train, season_length)
+
+sarima_m = auto.arima(daily_ts_diff, xreg = covid_intervention_adj) 
+summary(sarima_m)
+
+daily_ts_test <- daily_ts[(length(daily_ts_train)+1):length(daily_ts)]
+# Forecast sarima on the test data set
+sarima_forecast <- forecast(sarima_m, xreg = rep(0, length(daily_ts_test)))
+# Readjust/Un-difference the forecast to to measure accuracy
+
+sarima_forecast_rescale <- sarima_forecast
+
+# Adjust the mean of the first week of the forecast by subtracting the previous week from the original data
+sarima_forecast_rescale$mean <- sarima_forecast_rescale$mean + c(tail(daily_ts_train, season_length), rep(0, length(sarima_forecast_rescale$mean)-season_length)  )
+
+sarima_forecast_rescale$lower[,"80%"] <- sarima_forecast_rescale$lower[,"80%"] +c(tail(daily_ts_train, season_length), rep(0, length(sarima_forecast_rescale$mean)-season_length))
+
+sarima_forecast_rescale$lower[,"95%"] <- sarima_forecast_rescale$lower[,"95%"] +c(tail(daily_ts_train, season_length), rep(0, length(sarima_forecast_rescale$mean)-season_length))
+
+sarima_forecast_rescale$upper[,"80%"] <-
+  sarima_forecast_rescale$upper[,"80%"] +
+  c(
+    tail(daily_ts_train, season_length),
+    rep(0, length(sarima_forecast_rescale$mean)-season_length)
+  )
+
+sarima_forecast_rescale$upper[,"95%"] <-
+  sarima_forecast_rescale$upper[,"95%"] +
+  c(
+    tail(daily_ts_train, season_length),
+    rep(0, length(sarima_forecast_rescale$mean)-season_length)
+  )
+
+# Adjust all week after the first week of the forecast
+# We are doing that because there is no more original data to use for the adjustment so we to use forecast data 
+
+for(h in (season_length+1):length(daily_ts_test)) {
+  sarima_forecast_rescale$mean[h] <- 
+    sarima_forecast_rescale$mean[h] + sarima_forecast_rescale$mean[h-season_length]
+  sarima_forecast_rescale$lower[,"80%"][h] <- 
+    sarima_forecast_rescale$lower[,"80%"][h] +
+    sarima_forecast_rescale$mean[h-season_length]
+  sarima_forecast_rescale$lower[,"95%"][h] <- 
+    sarima_forecast_rescale$lower[,"95%"][h] +
+    sarima_forecast_rescale$mean[h-season_length]
+  sarima_forecast_rescale$upper[,"80%"][h] <- 
+    sarima_forecast_rescale$upper[,"80%"][h] +
+    sarima_forecast_rescale$mean[h-season_length]
+  sarima_forecast_rescale$upper[,"95%"][h] <- 
+    sarima_forecast_rescale$upper[,"95%"][h] +
+    sarima_forecast_rescale$mean[h-season_length]
+}
+
+sarima_accuracy <- accuracy(sarima_forecast_rescale, daily_ts_test)
+print(sarima_accuracy)
 ```
 
 
