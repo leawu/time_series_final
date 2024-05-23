@@ -1,0 +1,327 @@
+---
+title: "ADSP 31006 Final Project_Sally Lee_ETS Model"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-05-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height=5, fig.width=7) 
+# Default size for plots
+```
+
+## Preliminary Step
+
+### Load libraries, data, and prepare for the data
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+# Load Libraries
+library(TSA)       
+library(xts)
+library(forecast) 
+library(tseries)   
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(gridExtra) 
+library(zoo)
+library(readr)
+library(tidyr)
+
+# Load data
+data <- read.csv("/Users/sally/Desktop/ADSP 31006 Time Series/Final Project/count_check.csv")
+
+# Convert Trip_Start_Timestamp to POSIXct using the correct format
+data <- data %>%
+  mutate(Trip_Start_Timestamp = mdy_hms(Trip_Start_Timestamp))
+
+# Check for any parsing issues
+if (any(is.na(data$Trip_Start_Timestamp))) {
+  print("Warning: Some dates could not be parsed")
+  print(sum(is.na(data$Trip_Start_Timestamp)))
+}
+
+# Aggregate to daily demand
+daily_data <- data %>%
+  mutate(Date = as.Date(Trip_Start_Timestamp)) %>%
+  group_by(Date) %>%
+  summarise(count = sum(count, na.rm = TRUE))
+
+# Handle missing dates by filling with 0s
+all_dates <- seq(min(daily_data$Date), max(daily_data$Date), by = "day")
+daily_data <- data.frame(Date = all_dates) %>%
+  left_join(daily_data, by = "Date") %>%
+  replace_na(list(count = 0))
+```
+
+### Split the Train/Test Data
+
+<u>Since we need to forecast July to December 2023, we exclude the data from 1 July to 31 December 2023 when preparing our Time Series models, and reserve it to evaluate the models' performance. 
+
+To validate whether using data from 2013 - 2023 or 2022 - 2023 (post-COVID data) could better forecast the daily demand between July to December 2023, we created two sets of training datasets.</u>
+
+```{r}
+# Split data into train_all (up to June 2023) and test (July to December 2023)
+train_data_all <- daily_data %>% filter(Date <= as.Date("2023-06-30"))
+train_data_part <- daily_data %>% filter(Date >= as.Date("2022-01-01") & Date <= as.Date("2023-06-30"))
+test_data <- daily_data %>% filter(Date > as.Date("2023-06-30"))
+```
+
+## EDA
+
+### Plot the daily demand
+
+```{r}
+# Plot daily demand
+ggplot(daily_data, aes(x = Date, y = count)) +
+  geom_line() +
+  labs(title = "Daily Taxi Demand", x = "Time", y = "Trip Count")
+```
+
+### Check for stationarity using ACF plot and ADF test
+
+#### ACF Plot
+
+```{r}
+# ACF plot
+acf(daily_data$count, main="ACF of Daily Taxi Demand")
+```
+
+#### ADF Test
+
+```{r}
+# Check for stationarity using ADF test
+adf_test <- adf.test(daily_data$count)
+print(adf_test)
+```
+
+### Differencing by 1 to check Daily Demand and Stationality
+
+#### Differenced Daily Taxi Demand
+
+```{r}
+# Differencing to achieve stationarity if necessary
+daily_data_diff <- diff(daily_data$count)
+ggplot(data.frame(Date = daily_data$Date[-1], Diff_Count = daily_data_diff), aes(x = Date, y = Diff_Count)) +
+  geom_line() +
+  labs(title = "Differenced Daily Taxi Demand", x = "Time", y = "Differenced Trip Count")
+```
+
+#### Differenced ACF Plot
+
+```{r}
+# ACF plot for differenced data
+acf(daily_data_diff, main="ACF of Differenced Daily Taxi Demand")
+```
+
+### Convert the data into time series object
+
+```{r}
+# Convert data to time series object
+# Weekly frequency
+start_date <- as.Date(min(daily_data$Date))
+end_date <- as.Date(max(daily_data$Date))
+ts_data <- ts(daily_data$count, start=c(year(start_date), yday(start_date)), frequency=7)
+ts_train_data_all <- ts(train_data_all$count, start=c(year(start_date), yday(start_date)), frequency=7)
+ts_train_data_part <- ts(train_data_part$count, start=c(year(start_date), yday(start_date)), frequency=7)
+ts_test_data <- ts(test_data$count, start=c(year(start_date), yday(start_date)), frequency=7)
+```
+
+### Plot the trend of the time series data
+
+```{r}
+plot(ts_data, main="Daily Taxi Demand", xlab="Time", ylab="Trip Count")
+```
+
+### Plot the ACF of time series data
+
+```{r}
+# Plot the ACF
+acf(ts_data, main="ACF of Daily Taxi Demand")
+```
+
+### ADF test of time series data
+
+```{r}
+# Perform Augmented Dickey-Fuller test
+adf_test <- adf.test(ts_data)
+
+# Print test result
+print(adf_test)
+```
+
+#### STL Decomposition to check for Seasonality
+
+```{r}
+# Decompose the time series to check for seasonality
+ts_data_stl <- ts(daily_data$count, start=c(year(start_date), yday(start_date)), frequency=365)
+decomp <- stl(ts_data_stl, s.window="periodic")
+plot(decomp)
+```
+
+## 0. Use ETS for Forecasting - Auto ETS v.s. Manually Amended ETS
+
+### Use AAA ETS Model for forecasting
+
+```{r}
+# Try an ETS model with additive trend and seasonality
+ets_model_additive <- ets(ts_train_data_all, model="AAA")
+
+# Forecast and plot
+ets_forecast_additive <- forecast(ets_model_additive, h=184)
+plot(ets_forecast_additive)
+```
+
+```{r}
+# Check accuracy
+accuracy(ets_forecast_additive, test_data$count)
+```
+
+## 1. Use ETS for Forecasting - Data from 2013 to 2023
+
+### Fit the Auto ETS model
+
+<u> After trial and error, the auto ETS Model gives us the best performance metric.</u>
+
+```{r}
+# Fit ETS model
+ets_model <- ets(ts_train_data_all)
+```
+
+### Plot the forecast
+
+```{r}
+# Forecast for the test period
+ets_forecast <- forecast(ets_model, h = nrow(test_data))
+
+# Plot the forecast
+plot(ets_forecast)
+```
+
+### Performance Metrics of ETS Model
+
+```{r}
+# Calculate accuracy
+accuracy(ets_forecast, test_data$count)
+```
+
+### Calculate and Extract MAE, RMSE, and MAPE from ETS Model
+
+```{r}
+# Combine actual and forecasted values
+comparison_ets <- data.frame(Date = test_data$Date, Actual = test_data$count, Forecasted = ets_forecast$mean)
+
+# Calculate MAE and RMSE
+mae_ets <- mean(abs(comparison_ets$Actual - comparison_ets$Forecasted))
+rmse_ets <- sqrt(mean((comparison_ets$Actual - comparison_ets$Forecasted)^2))
+mape_ets <- mean(abs((comparison_ets$Actual - comparison_ets$Forecasted) / comparison_ets$Actual)) * 100
+
+print(paste("ETS MAE: ", mae_ets))
+print(paste("ETS RMSE: ", rmse_ets))
+print(paste("ETS MAPE: ", mape_ets))
+```
+
+### Plot the Forecasted v.s. Actual Graph for comparison
+
+```{r}
+# Plot actual vs forecasted values
+ggplot(comparison_ets, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecasted, color = "Forecasted")) +
+  labs(title = "Actual vs Forecasted Daily Taxi Demand (ETS Model)", x = "Time", y = "Trip Count") +
+  scale_color_manual(values = c("Actual" = "blue", "Forecasted" = "red"))
+```
+
+## Check the residuals after fitting the ETS Model for Model Refinement
+
+### ETS Model Residuals Plot
+
+```{r}
+# Extract residuals
+ets_residuals <- resid(ets_model)
+
+# Plot residuals
+plot(ets_residuals, main = "ETS Model Residuals")
+```
+
+### ETS Model Residuals ACF Plot
+
+```{r}
+# Plot ACF for the residuals
+acf(ets_residuals)
+```
+
+## 2. Use ETS for Forecasting - using Post-COVID Data from 2022 to 2023
+
+### Fit the Auto ETS model
+
+<u> After trial and error, the auto ETS Model gives us the best performance metric.</u>
+
+```{r}
+# Fit ETS model
+ets_model_part <- ets(ts_train_data_part)
+```
+
+### Plot the forecast
+
+```{r}
+# Forecast for the test period
+ets_forecast_part <- forecast(ets_model_part, h = nrow(test_data))
+
+# Plot the forecast
+plot(ets_forecast_part)
+```
+
+### Performance Metrics of ETS Model
+
+```{r}
+# Calculate accuracy
+accuracy(ets_forecast_part, test_data$count)
+```
+
+### Calculate and Extract MAE, RMSE, and MAPE from ETS Model
+
+```{r}
+# Combine actual and forecasted values
+comparison_ets_part <- data.frame(Date = test_data$Date, Actual = test_data$count, Forecasted = ets_forecast_part$mean)
+
+# Calculate MAE and RMSE
+mae_ets_part <- mean(abs(comparison_ets_part$Actual - comparison_ets_part$Forecasted))
+rmse_ets_part <- sqrt(mean((comparison_ets_part$Actual - comparison_ets_part$Forecasted)^2))
+mape_ets_part <- mean(abs((comparison_ets_part$Actual - comparison_ets_part$Forecasted) / comparison_ets_part$Actual)) * 100
+
+print(paste("ETS MAE: ", mae_ets_part))
+print(paste("ETS RMSE: ", rmse_ets_part))
+print(paste("ETS MAPE: ", mape_ets_part))
+```
+
+### Plot the Forecasted v.s. Actual Graph for comparison
+
+```{r}
+# Plot actual vs forecasted values
+ggplot(comparison_ets_part, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecasted, color = "Forecasted")) +
+  labs(title = "Actual vs Forecasted Daily Taxi Demand (ETS Model using Post-COVID Data)", x = "Time", y = "Trip Count") +
+  scale_color_manual(values = c("Actual" = "blue", "Forecasted" = "red"))
+```
+
+## Check the residuals after fitting the ETS Model for Model Refinement
+
+### ETS Model (using Post-COVID data) Residuals Plot
+
+```{r}
+# Extract residuals
+ets_residuals_part <- resid(ets_model_part)
+
+# Plot residuals
+plot(ets_residuals_part, main = "ETS Model using Post-COVID Data - Residuals")
+```
+
+### ETS Model (using Post-COVID data) Residuals ACF Plot
+
+```{r}
+# Plot ACF for the residuals
+acf(ets_residuals_part)
+```

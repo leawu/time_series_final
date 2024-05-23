@@ -1,0 +1,280 @@
+---
+title: "ADSP 31006 Final Project_Sally Lee_Prophet Model"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-05-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height=5, fig.width=7) 
+# Default size for plots
+```
+
+## Preliminary Step
+
+### Load libraries, data, and prepare for the data
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+# Load Libraries
+library(TSA)       
+library(xts)
+library(forecast) 
+library(tseries)   
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(gridExtra) 
+library(zoo)
+library(readr)
+library(tidyr)
+
+# Load data
+data <- read.csv("/Users/sally/Desktop/ADSP 31006 Time Series/Final Project/count_check.csv")
+
+# Convert Trip_Start_Timestamp to POSIXct using the correct format
+data <- data %>%
+  mutate(Trip_Start_Timestamp = mdy_hms(Trip_Start_Timestamp))
+
+# Check for any parsing issues
+if (any(is.na(data$Trip_Start_Timestamp))) {
+  print("Warning: Some dates could not be parsed")
+  print(sum(is.na(data$Trip_Start_Timestamp)))
+}
+
+# Aggregate to daily demand
+daily_data <- data %>%
+  mutate(Date = as.Date(Trip_Start_Timestamp)) %>%
+  group_by(Date) %>%
+  summarise(count = sum(count, na.rm = TRUE))
+
+# Handle missing dates by filling with 0s
+all_dates <- seq(min(daily_data$Date), max(daily_data$Date), by = "day")
+daily_data <- data.frame(Date = all_dates) %>%
+  left_join(daily_data, by = "Date") %>%
+  replace_na(list(count = 0))
+```
+
+### Split the Train/Test Data
+
+<u>Since we need to forecast July to December 2023, we exclude the data from 1 July to 31 December 2023 when preparing our Time Series models, and reserve it to evaluate the models' performance. </u>
+
+```{r}
+# Split data into train_all (up to June 2023) and test (July to December 2023)
+train_data_all <- daily_data %>% filter(Date <= as.Date("2023-06-30"))
+test_data <- daily_data %>% filter(Date > as.Date("2023-06-30"))
+```
+
+## EDA
+
+### Plot the daily demand
+
+```{r}
+# Plot daily demand
+ggplot(daily_data, aes(x = Date, y = count)) +
+  geom_line() +
+  labs(title = "Daily Taxi Demand", x = "Time", y = "Trip Count")
+```
+
+### Check for stationarity using ACF plot and ADF test
+
+#### ACF Plot
+
+```{r}
+# ACF plot
+acf(daily_data$count, main="ACF of Daily Taxi Demand")
+```
+
+#### ADF Test
+
+```{r}
+# Check for stationarity using ADF test
+adf_test <- adf.test(daily_data$count)
+print(adf_test)
+```
+
+### Differencing by 1 to check Daily Demand and Stationality
+
+#### Differenced Daily Taxi Demand
+
+```{r}
+# Differencing to achieve stationarity if necessary
+daily_data_diff <- diff(daily_data$count)
+ggplot(data.frame(Date = daily_data$Date[-1], Diff_Count = daily_data_diff), aes(x = Date, y = Diff_Count)) +
+  geom_line() +
+  labs(title = "Differenced Daily Taxi Demand", x = "Time", y = "Differenced Trip Count")
+```
+
+#### Differenced ACF Plot
+
+```{r}
+# ACF plot for differenced data
+acf(daily_data_diff, main="ACF of Differenced Daily Taxi Demand")
+```
+
+### Convert the data into time series object
+
+```{r}
+# Convert data to time series object
+# Weekly frequency, start date as the first date in your data
+start_date <- as.Date(min(daily_data$Date))
+end_date <- as.Date(max(daily_data$Date))
+ts_data <- ts(daily_data$count, start=c(year(start_date), yday(start_date)), frequency=7)
+ts_train_data_all <- ts(train_data_all$count, start=c(year(start_date), yday(start_date)), frequency=7)
+ts_test_data <- ts(test_data$count, start=c(year(start_date), yday(start_date)), frequency=7)
+```
+
+### Plot the trend of the time series data
+
+```{r}
+plot(ts_data, main="Daily Taxi Demand", xlab="Time", ylab="Trip Count")
+```
+
+### Plot the ACF of time series data
+
+```{r}
+# Plot the ACF
+acf(ts_data, main="ACF of Daily Taxi Demand")
+```
+
+### ADF test of time series data
+
+```{r}
+# Perform Augmented Dickey-Fuller test
+adf_test <- adf.test(ts_data)
+
+# Print test result
+print(adf_test)
+```
+
+#### STL Decomposition to check for Seasonality
+
+```{r}
+# Decompose the time series to check for seasonality
+ts_data_stl <- ts(daily_data$count, start=c(year(start_date), yday(start_date)), frequency=365)
+decomp <- stl(ts_data_stl, s.window="periodic")
+plot(decomp)
+```
+
+
+## Use Prophet Model for forecasting
+
+### Prepare training data for Prophet Model
+
+```{r}
+#install.packages("prophet")
+library(prophet)
+```
+
+```{r}
+# Prepare training data for Prophet
+prophet_train_data_all <- train_data_all %>%
+  rename(ds = Date, y = count)
+```
+
+### Define windows holidays - COVID Impact, Thanksgiving, Christmas
+
+```{r}
+# Define holidays for COVID impact
+covid_holidays <- data.frame(
+  holiday = 'covid',
+  ds = seq.Date(as.Date('2020-03-01'), as.Date('2021-12-31'), by = 'day'),
+  lower_window = 0,
+  upper_window = 1
+)
+
+# Define Thanksgiving and Christmas holidays
+thanksgiving <- data.frame(
+  holiday = 'thanksgiving',
+  ds = as.Date(c('2020-11-26', '2021-11-25')),  # Thanksgiving dates for 2020 and 2021
+  lower_window = 0,
+  upper_window = 1
+)
+
+christmas <- data.frame(
+  holiday = 'christmas',
+  ds = as.Date(c('2020-12-25', '2021-12-25')),  # Christmas dates for 2020 and 2021
+  lower_window = 0,
+  upper_window = 1
+)
+
+# Combine all holiday data frames
+all_holidays <- rbind(covid_holidays, thanksgiving, christmas)
+```
+
+### Fit the model
+
+```{r}
+# Fit the model using training data
+m_all <- prophet(prophet_train_data_all, holidays = all_holidays, weekly.seasonality = TRUE,
+                 changepoint.prior.scale = 0.05,  # Example of adjusting changepoint prior scale
+                 seasonality.prior.scale = 10     # Example of adjusting seasonality prior scale
+)
+```
+
+### Forecast future value using Prophet Model
+
+```{r}
+# Forecast future values
+future_all <- make_future_dataframe(m_all, periods = nrow(test_data))
+forecast_all <- predict(m_all, future_all)
+```
+
+### Plot the Forecast
+
+```{r}
+# Plot forecast
+plot(m_all, forecast_all) +
+  ggtitle("Forecast for July to Dec 2023 (Prophet Model)")
+```
+
+### Evaluate the Prophet Model - MAE, RMSE, and MAPE
+
+```{r}
+# Merge actual test data with forecast
+comparison_all <- merge(test_data, forecast_all %>% select(ds, yhat), by.x = "Date", by.y = "ds")
+```
+
+```{r}
+# Calculate MAE and RMSE
+mae_all <- mean(abs(comparison_all$count - comparison_all$yhat))
+rmse_all <- sqrt(mean((comparison_all$count - comparison_all$yhat)^2))
+mape_all <- mean(abs((comparison_all$count - comparison_all$yhat) / comparison_all$count)) * 100
+
+print(paste("Prophet MAE: ", mae_all))
+print(paste("Prophet RMSE: ", rmse_all))
+print(paste("Prophet MAPE: ", mape_all))
+```
+
+### Plot Forecasted v.s. Actual Value using Prophet Model
+
+```{r}
+# Plot actual vs forecasted values
+ggplot(comparison_all, aes(x = Date)) +
+  geom_line(aes(y = count, color = "Actual")) +
+  geom_line(aes(y = yhat, color = "Forecasted")) +
+  labs(title = "Actual vs Forecasted Daily Taxi Demand (Prophet Model)", x = "Time", y = "Trip Count") +
+  scale_color_manual(values = c("Actual" = "blue", "Forecasted" = "red"))
+```
+
+## Check the residuals after fitting the Prophet Model for Model Refinement
+
+```{r}
+# Calculate residuals
+comparison_all$residuals <- comparison_all$count - comparison_all$yhat
+
+# Plot residuals
+ggplot(comparison_all, aes(x = Date, y = residuals)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals Plot (Prophet Model)", x = "Time", y = "Residuals")
+```
+
+### Prophet Model Residuals ACF Plot
+
+```{r}
+# Plot ACF for Prophet Model Residuals
+prophet_residuals <- comparison_all$residuals
+acf(prophet_residuals)
+```
+
